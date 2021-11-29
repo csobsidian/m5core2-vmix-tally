@@ -2,6 +2,8 @@
 #include <M5Core2.h>
 #include <WiFi.h>
 #include "Config.h"
+#include <limits.h>
+
 
 // Defines
 #define MAX_PASS_LEN 65
@@ -13,6 +15,7 @@
 #define CFG_PORT_DEFAULT 8099
 #define CFG_TALLY_INPUT_DEFAULT 2
 #define CFG_TALLY_TITLE_DEFAULT true
+#define CFG_DISPLAY_TIMEOUT_MS_DEFAULT 60000
 
 
 // Enums
@@ -49,6 +52,7 @@ uint16_t inputNum;
 bool showTitle;
 char title[MAX_TITLE_LEN];
 int pos;
+uint16_t displayTimeoutMs;
 
 
 void setup()
@@ -61,12 +65,13 @@ void setup()
 
   // Get config vars
   cfg.begin();
-  cfg.getValue("network",    "ssid", ssid, sizeof(ssid), CFG_SSID_DEFAULT);
-  cfg.getValue("network",    "pass", pass, sizeof(pass), CFG_PASS_DEFAULT);
-  cfg.getValue("vMix",       "addr", addr, sizeof(addr), CFG_ADDR_DEFAULT); 
-  cfg.getValue("vMix",       "port", port,               CFG_PORT_DEFAULT);
-  cfg.getValue("vMix",      "tally", inputNum,           CFG_TALLY_INPUT_DEFAULT);
-  cfg.getValue("vMix", "show-title", showTitle,          CFG_TALLY_TITLE_DEFAULT);
+  cfg.getValue("network",      "ssid", ssid, sizeof(ssid), CFG_SSID_DEFAULT);
+  cfg.getValue("network",      "pass", pass, sizeof(pass), CFG_PASS_DEFAULT);
+  cfg.getValue("vMix",         "addr", addr, sizeof(addr), CFG_ADDR_DEFAULT); 
+  cfg.getValue("vMix",         "port", port,               CFG_PORT_DEFAULT);
+  cfg.getValue("vMix",        "tally", inputNum,           CFG_TALLY_INPUT_DEFAULT);
+  cfg.getValue("vMix",   "show-title", showTitle,          CFG_TALLY_TITLE_DEFAULT);
+  cfg.getValue("vMix", "disp-timeout", displayTimeoutMs,   CFG_DISPLAY_TIMEOUT_MS_DEFAULT);
 
   pos = strlen(vmixTallyReply) + inputNum - 1;
 
@@ -79,6 +84,7 @@ void setup()
   delay(3000);
   // Start WiFi
   WiFi.begin(ssid, pass);
+  client.setTimeout(1);
 }
 
 
@@ -97,6 +103,10 @@ void loop()
 }
 
 void doWiFiConnect() {
+  unsigned long t1 = millis();  
+  unsigned long t2 = t1;
+  bool screenHidden = false;
+  
   showStatus(WIFI_CONNECT);
 
   if (client.connected()) {
@@ -107,6 +117,13 @@ void doWiFiConnect() {
 
   int i = 0;
   while(WiFi.status() != WL_CONNECTED) {
+    M5.update();
+    if (screenHidden && TOUCH->ispressed()) {
+      t1 = millis();
+      t2 = t1;
+      screenHidden = saveScreen(false);
+    }
+    
     if (i > 2) {
       M5.Lcd.fillRect(0, 96, 320, 16, BLACK);
       M5.Lcd.setCursor(12, 96);
@@ -115,7 +132,17 @@ void doWiFiConnect() {
     M5.Lcd.printf(".");
     i++;
     delay(500);
+
+    t2 = millis();
+    if ((deltaMs(t1, t2) > displayTimeoutMs) && (!screenHidden)) {
+      screenHidden = saveScreen(true);
+    }
   }
+
+  if (screenHidden) {
+    saveScreen(false);
+  }
+  
   M5.Lcd.fillRect(0, 96, 320, 16, BLACK);
   M5.Lcd.setCursor(12, 96);
   M5.Lcd.print("Connected!\n\n IP: ");
@@ -124,11 +151,22 @@ void doWiFiConnect() {
 }
 
 void doClientConnect() {
+  unsigned long t1 = millis();  
+  unsigned long t2 = t1;
+  bool screenHidden = false;
+
   showStatus(VMIX_CONNECT);
   
   subscribed = false;
   int i = 0;
   while (!client.connect(addr, port)) {
+    M5.update();
+    if (screenHidden && TOUCH->ispressed()) {
+      t1 = millis();
+      t2 = t1;
+      screenHidden = saveScreen(false);
+    }
+    
     if (WiFi.status() != WL_CONNECTED) {
       return;
     }
@@ -141,9 +179,19 @@ void doClientConnect() {
     
     M5.Lcd.printf(".");
     i++;
-    delay(500);
+    // No delay. Arduino WiFiClient setTimeout is in seconds (1)
+    //delay(500);
+
+    t2 = millis();
+    if ((deltaMs(t1, t2) > displayTimeoutMs) && (!screenHidden)) {
+      screenHidden = saveScreen(true);
+    }
   }
 
+  if (screenHidden) {
+    saveScreen(false);
+  }
+  
   M5.Lcd.fillRect(0, 96, 320, 16, BLACK);
   M5.Lcd.setCursor(12, 96);
   M5.Lcd.print("Connected!\n");
@@ -152,15 +200,24 @@ void doClientConnect() {
 
 
 void doClientComms() {
+  static unsigned long t1;
+  
   if (!subscribed) {
     client.print(vmixTitleCommand);
     client.print(vmixTallyCommand);
     subscribed = true;
   }
 
+  if (deltaMs(t1, millis()) > 5000) {
+    client.print(vmixTitleCommand);
+    t1 = millis();
+  }
+
+
   while (client.available() > 0){
     String line = client.readStringUntil('\r\n');
-
+    Serial.println(line);
+    
     if (line.startsWith(vmixTallyReply)) {
       if (pos < line.length()) {
         switch (line.charAt(pos)) {
@@ -184,17 +241,12 @@ void doClientComms() {
       if (line.length() > sizeof(title) - 1) {
         title[64] = '\0';
       }
-    } else {
-      m5.lcd.println(line);
+
+      t1 = millis();
     }
   }
 }
 
-
-void doSendCommand() {
-  //send a request
-  //client.print("TALLY\r\n");
-}
 
 void showStatus(appStatus s) {
   lastState = state;
@@ -280,4 +332,31 @@ void showStatus(appStatus s) {
       break;
   }
   
+}
+
+unsigned long deltaMs(unsigned long t1, unsigned long t2) {
+  if (t1 <= t2) {
+    return (t2 - t1);
+  } else {
+    return (ULONG_MAX - t1) + t2;
+  }
+}
+
+
+bool saveScreen(bool save) {
+  if (save) {
+    // Turn off backlight and display
+    M5.Lcd.startWrite();
+    M5.Lcd.writecommand(ILI9341_DISPOFF);
+    M5.Lcd.endWrite();
+    M5.Lcd.setBrightness(0);
+  } else {
+    // Turn on backlight and display
+    M5.Lcd.startWrite();
+    M5.Lcd.writecommand(ILI9341_DISPON);
+    M5.Lcd.endWrite();
+    M5.Lcd.setBrightness(100);
+  }
+
+  return save;
 }
